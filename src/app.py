@@ -1,6 +1,8 @@
 """
 Nutrition Intelligence Scanner Lambda
 Calls OpenAI GPT-5.2-mini, stores result in DynamoDB, returns the analysis.
+OpenAI API key is fetched securely from AWS Secrets Manager and cached
+in-memory for the lifetime of the Lambda container (warm invocations).
 """
 
 import json
@@ -10,10 +12,35 @@ import boto3
 from openai import OpenAI
 from datetime import datetime, timezone
 
-# ── Clients ──────────────────────────────────────────────
-openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# ── AWS Clients ───────────────────────────────────────────
+secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["DYNAMODB_TABLE"])
+rate_limit_table = dynamodb.Table(os.environ["RATE_LIMIT_TABLE"])
+
+# ── Rate limit config ─────────────────────────────────────
+RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "50"))
+
+# ── In-memory secret cache (persists across warm invocations) ──
+_openai_client_cache: OpenAI | None = None
+
+
+def _get_openai_client() -> OpenAI:
+    """
+    Fetch the OpenAI API key from Secrets Manager on first call,
+    then reuse the cached client for subsequent warm invocations.
+    """
+    global _openai_client_cache
+    if _openai_client_cache is not None:
+        return _openai_client_cache
+
+    secret_arn = os.environ["OPENAI_SECRET_ARN"]
+    response = secrets_client.get_secret_value(SecretId=secret_arn)
+    secret = json.loads(response["SecretString"])
+    api_key = secret["OPENAI_API_KEY"]
+
+    _openai_client_cache = OpenAI(api_key=api_key)
+    return _openai_client_cache
 
 # ── System prompt (v7.1) ────────────────────────────────
 SYSTEM_PROMPT = r"""SYSTEM PROMPT — Advanced Nutrition Intelligence Scanner (API) v7.1
@@ -252,6 +279,49 @@ Return ONLY valid JSON matching this schema (no markdown, no extra text):
 }"""
 
 
+def _check_and_increment_rate_limit(device_id: str) -> tuple[bool, int, int]:
+    """
+    Atomically increment today's request count for a device.
+    Uses DynamoDB conditional UpdateItem so the counter is race-condition safe.
+
+    Returns:
+        (allowed, current_count, limit)
+        allowed=False means the device has hit the daily cap.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # TTL = end of today UTC (midnight of next day) in epoch seconds
+    tomorrow_midnight = int(
+        datetime(
+            *[int(p) for p in today.split("-")],
+            tzinfo=timezone.utc
+        ).timestamp()
+    ) + 86400  # +24 h
+
+    try:
+        response = rate_limit_table.update_item(
+            Key={"deviceId": device_id, "date": today},
+            UpdateExpression=(
+                "SET #cnt = if_not_exists(#cnt, :zero) + :one, "
+                "#ttl = if_not_exists(#ttl, :ttl)"
+            ),
+            ExpressionAttributeNames={"#cnt": "requestCount", "#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":zero": 0,
+                ":one": 1,
+                ":ttl": tomorrow_midnight,
+            },
+            ReturnValues="UPDATED_NEW",
+        )
+        current = int(response["Attributes"]["requestCount"])
+        allowed = current <= RATE_LIMIT_MAX
+        return allowed, current, RATE_LIMIT_MAX
+    except Exception as e:
+        # Fail open — don't block the request if DynamoDB has a transient error
+        print(f"Rate limit check error (failing open): {e}")
+        return True, -1, RATE_LIMIT_MAX
+
+
 def _normalize_food_name(food_items_raw: str) -> str:
     """
     Create a canonical DynamoDB partition key from the raw food input.
@@ -274,6 +344,7 @@ def _call_openai(food_items: str, user_profile: dict | None = None,
 
     user_content = "\n".join(user_message_parts)
 
+    openai_client = _get_openai_client()
     response = openai_client.chat.completions.create(
         model="gpt-5.2-mini",
         messages=[
@@ -331,11 +402,34 @@ def lambda_handler(event, context):
     except json.JSONDecodeError:
         return _build_response(400, {"error": "Invalid JSON body"})
 
+    # ── Device ID (required for rate limiting) ───────────
+    device_id = (
+        body.get("deviceId")
+        or (event.get("headers") or {}).get("x-device-id")
+        or (event.get("headers") or {}).get("X-Device-Id")
+    )
+    if not device_id:
+        return _build_response(400, {
+            "error": "Missing deviceId",
+            "detail": "Send deviceId in the request body or x-device-id header.",
+        })
+
+    # ── Rate limit check ──────────────────────────────────
+    allowed, current_count, limit = _check_and_increment_rate_limit(device_id)
+    if not allowed:
+        return _build_response(429, {
+            "error": "Daily rate limit exceeded",
+            "detail": f"Device '{device_id}' has used {current_count}/{limit} requests today. Resets at midnight UTC.",
+            "requestsUsed": current_count,
+            "requestsLimit": limit,
+        })
+
     food_items = body.get("foodItems")
     if not food_items:
         return _build_response(400, {
             "error": "Missing required field: foodItems",
             "usage": {
+                "deviceId": "your-unique-device-id",
                 "foodItems": "spinach, eggs",
                 "version": "v1 (optional)",
                 "userProfile": "{} (optional)",
@@ -371,4 +465,10 @@ def lambda_handler(event, context):
         "foodItem": food_key,
         "version": version,
         "analysis": analysis,
+        "rateLimit": {
+            "requestsUsed": current_count,
+            "requestsLimit": limit,
+            "requestsRemaining": max(0, limit - current_count),
+            "resetsAt": "midnight UTC",
+        },
     })

@@ -6,7 +6,7 @@ Parameters:
   OpenAIApiKey:
     Type: String
     NoEcho: true
-    Description: Your OpenAI API key
+    Description: Your OpenAI API key (will be stored in Secrets Manager)
   StageName:
     Type: String
     Default: prod
@@ -16,12 +16,44 @@ Globals:
   Function:
     Timeout: 120
     MemorySize: 256
-    Runtime: python3.12
+    Runtime: python3.13
 
 Resources:
 
   # ──────────────────────────────────────────────
-  # DynamoDB Table
+  # Secrets Manager — OpenAI API Key
+  # ──────────────────────────────────────────────
+  OpenAISecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: nutrition-ai/openai-api-key
+      Description: OpenAI API key for Nutrition Intelligence Scanner
+      SecretString: !Sub '{"OPENAI_API_KEY":"${OpenAIApiKey}"}'
+
+  # ──────────────────────────────────────────────
+  # DynamoDB Table — Rate Limiting (per device/day)
+  # ──────────────────────────────────────────────
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: NutritionRateLimit
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: deviceId
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: deviceId
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true   # rows auto-deleted after midnight UTC
+
+  # ──────────────────────────────────────────────
+  # DynamoDB Table — Nutrition Analysis
   # ──────────────────────────────────────────────
   NutritionTable:
     Type: AWS::DynamoDB::Table
@@ -50,11 +82,20 @@ Resources:
       Handler: app.lambda_handler
       Environment:
         Variables:
-          OPENAI_API_KEY: !Ref OpenAIApiKey
+          OPENAI_SECRET_ARN: !Ref OpenAISecret
           DYNAMODB_TABLE: !Ref NutritionTable
+          RATE_LIMIT_TABLE: !Ref RateLimitTable
+          RATE_LIMIT_MAX: "50"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref NutritionTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref OpenAISecret
       Events:
         AnalyzeFood:
           Type: Api
@@ -123,3 +164,9 @@ Outputs:
   DynamoDBTableName:
     Description: DynamoDB table name
     Value: !Ref NutritionTable
+  RateLimitTableName:
+    Description: DynamoDB rate limit table name
+    Value: !Ref RateLimitTable
+  OpenAISecretArn:
+    Description: Secrets Manager ARN for OpenAI API key
+    Value: !Ref OpenAISecret
