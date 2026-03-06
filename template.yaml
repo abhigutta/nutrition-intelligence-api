@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Nutrition Intelligence Scanner API - GPT 5.2 Mini backed Lambda with DynamoDB
+
+Parameters:
+  OpenAIApiKey:
+    Type: String
+    NoEcho: true
+    Description: Your OpenAI API key
+  StageName:
+    Type: String
+    Default: prod
+    Description: API Gateway stage name
+
+Globals:
+  Function:
+    Timeout: 120
+    MemorySize: 256
+    Runtime: python3.12
+
+Resources:
+
+  # ──────────────────────────────────────────────
+  # DynamoDB Table
+  # ──────────────────────────────────────────────
+  NutritionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: NutritionAnalysis
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: foodItem
+          AttributeType: S
+        - AttributeName: version
+          AttributeType: S
+      KeySchema:
+        - AttributeName: foodItem
+          KeyType: HASH
+        - AttributeName: version
+          KeyType: RANGE
+
+  # ──────────────────────────────────────────────
+  # Lambda Function
+  # ──────────────────────────────────────────────
+  NutritionAnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: NutritionAnalyzerFunction
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          OPENAI_API_KEY: !Ref OpenAIApiKey
+          DYNAMODB_TABLE: !Ref NutritionTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NutritionTable
+      Events:
+        AnalyzeFood:
+          Type: Api
+          Properties:
+            Path: /analyze
+            Method: POST
+            RestApiId: !Ref NutritionApi
+            Auth:
+              ApiKeyRequired: true
+
+  # ──────────────────────────────────────────────
+  # API Gateway
+  # ──────────────────────────────────────────────
+  NutritionApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: NutritionIntelligenceAPI
+      StageName: !Ref StageName
+      Auth:
+        ApiKeyRequired: true
+
+  # ──────────────────────────────────────────────
+  # API Key + Usage Plan
+  # ──────────────────────────────────────────────
+  NutritionApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn:
+      - NutritionApiprodStage
+    Properties:
+      Name: NutritionApiKey
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref NutritionApi
+          StageName: !Ref StageName
+
+  NutritionUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+      - NutritionApiprodStage
+    Properties:
+      UsagePlanName: NutritionUsagePlan
+      ApiStages:
+        - ApiId: !Ref NutritionApi
+          Stage: !Ref StageName
+      Throttle:
+        BurstLimit: 10
+        RateLimit: 5
+      Quota:
+        Limit: 1000
+        Period: MONTH
+
+  NutritionUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref NutritionApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref NutritionUsagePlan
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${NutritionApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/analyze"
+  ApiKeyId:
+    Description: API Key ID (retrieve value with aws apigateway get-api-key --api-key <id> --include-value)
+    Value: !Ref NutritionApiKey
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref NutritionTable
