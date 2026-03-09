@@ -6,7 +6,7 @@ Parameters:
   OpenAIApiKey:
     Type: String
     NoEcho: true
-    Description: Your OpenAI API key
+    Description: Your OpenAI API key (will be stored in Secrets Manager)
   StageName:
     Type: String
     Default: prod
@@ -17,6 +17,31 @@ Globals:
     MemorySize: 256
     Runtime: python3.13
 Resources:
+  OpenAISecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: nutrition-ai/openai-api-key
+      Description: OpenAI API key for Nutrition Intelligence Scanner
+      SecretString:
+        Fn::Sub: '{"OPENAI_API_KEY":"${OpenAIApiKey}"}'
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: NutritionRateLimit
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: deviceId
+        AttributeType: S
+      - AttributeName: date
+        AttributeType: S
+      KeySchema:
+      - AttributeName: deviceId
+        KeyType: HASH
+      - AttributeName: date
+        KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
   NutritionTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -40,19 +65,40 @@ Resources:
       Handler: app.lambda_handler
       Environment:
         Variables:
-          OPENAI_API_KEY:
-            Ref: OpenAIApiKey
+          OPENAI_SECRET_ARN:
+            Ref: OpenAISecret
           DYNAMODB_TABLE:
             Ref: NutritionTable
+          RATE_LIMIT_TABLE:
+            Ref: RateLimitTable
+          RATE_LIMIT_MAX: '50'
       Policies:
       - DynamoDBCrudPolicy:
           TableName:
             Ref: NutritionTable
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: RateLimitTable
+      - Statement:
+        - Effect: Allow
+          Action:
+          - secretsmanager:GetSecretValue
+          Resource:
+            Ref: OpenAISecret
       Events:
         AnalyzeFood:
           Type: Api
           Properties:
             Path: /analyze
+            Method: POST
+            RestApiId:
+              Ref: NutritionApi
+            Auth:
+              ApiKeyRequired: true
+        ScanFood:
+          Type: Api
+          Properties:
+            Path: /scan
             Method: POST
             RestApiId:
               Ref: NutritionApi
@@ -64,8 +110,7 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       Name: NutritionIntelligenceAPI
-      StageName:
-        Ref: StageName
+      StageName: prod
       Auth:
         ApiKeyRequired: true
   NutritionApiKey:
@@ -78,8 +123,7 @@ Resources:
       StageKeys:
       - RestApiId:
           Ref: NutritionApi
-        StageName:
-          Ref: StageName
+        StageName: prod
   NutritionUsagePlan:
     Type: AWS::ApiGateway::UsagePlan
     DependsOn:
@@ -89,8 +133,7 @@ Resources:
       ApiStages:
       - ApiId:
           Ref: NutritionApi
-        Stage:
-          Ref: StageName
+        Stage: prod
       Throttle:
         BurstLimit: 10
         RateLimit: 5
@@ -106,10 +149,14 @@ Resources:
       UsagePlanId:
         Ref: NutritionUsagePlan
 Outputs:
-  ApiEndpoint:
-    Description: API Gateway endpoint URL
+  AnalyzeEndpoint:
+    Description: API Gateway endpoint for food analysis
     Value:
-      Fn::Sub: https://${NutritionApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/analyze
+      Fn::Sub: https://${NutritionApi}.execute-api.${AWS::Region}.amazonaws.com/prod/analyze
+  ScanEndpoint:
+    Description: API Gateway endpoint for image scanning
+    Value:
+      Fn::Sub: https://${NutritionApi}.execute-api.${AWS::Region}.amazonaws.com/prod/scan
   ApiKeyId:
     Description: API Key ID (retrieve value with aws apigateway get-api-key --api-key
       <id> --include-value)
@@ -119,3 +166,11 @@ Outputs:
     Description: DynamoDB table name
     Value:
       Ref: NutritionTable
+  RateLimitTableName:
+    Description: DynamoDB rate limit table name
+    Value:
+      Ref: RateLimitTable
+  OpenAISecretArn:
+    Description: Secrets Manager ARN for OpenAI API key
+    Value:
+      Ref: OpenAISecret

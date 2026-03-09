@@ -8,6 +8,7 @@ in-memory for the lifetime of the Lambda container (warm invocations).
 import json
 import os
 import re
+import base64
 import boto3
 from openai import OpenAI
 from datetime import datetime, timezone
@@ -346,18 +347,78 @@ def _call_openai(food_items: str, user_profile: dict | None = None,
 
     openai_client = _get_openai_client()
     response = openai_client.chat.completions.create(
-        model="gpt-5.2-mini",
+        model="gpt-5-mini",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        temperature=0.3,
-        max_tokens=16000,
+        max_completion_tokens=4000,
         response_format={"type": "json_object"},
     )
 
     raw_text = response.choices[0].message.content
     return json.loads(raw_text)
+
+
+def _scan_image(image_base64: str) -> dict:
+    """Send an image to OpenAI vision to identify food items."""
+    openai_client = _get_openai_client()
+
+    # Detect MIME type from base64 header or default to jpeg
+    if image_base64.startswith("data:"):
+        # Already has data URI prefix — use as-is
+        image_url = image_base64
+    else:
+        image_url = f"data:image/jpeg;base64,{image_base64}"
+
+    response = openai_client.chat.completions.create(
+        model="gpt-5-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a food identification assistant. Analyze the image and "
+                    "identify all distinct food items visible. Return ONLY valid JSON "
+                    "matching this schema (no markdown, no extra text):\n"
+                    '{"foods": [{"name": "food name", "confidence": "high|medium|low"}], '
+                    '"description": "brief description of what you see"}'
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Identify all food items in this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url, "detail": "low"},
+                    },
+                ],
+            },
+        ],
+        max_completion_tokens=1000,
+        response_format={"type": "json_object"},
+    )
+
+    raw_text = response.choices[0].message.content
+    return json.loads(raw_text)
+
+
+def _lookup_in_dynamodb(food_key: str, version: str) -> dict | None:
+    """Check DynamoDB for an existing analysis. Returns the item or None."""
+    try:
+        response = table.get_item(Key={"foodItem": food_key, "version": version})
+        item = response.get("Item")
+        if item and "analysis" in item:
+            return {
+                "foodItem": item["foodItem"],
+                "version": item["version"],
+                "analysis": json.loads(item["analysis"]),
+                "createdAt": item.get("createdAt"),
+                "source": "cache",
+            }
+    except Exception as e:
+        print(f"DynamoDB lookup error: {e}")
+    return None
 
 
 def _store_in_dynamodb(food_key: str, version: str, analysis: dict,
@@ -370,7 +431,7 @@ def _store_in_dynamodb(food_key: str, version: str, analysis: dict,
             "rawInput": raw_input,
             "analysis": json.dumps(analysis),  # stored as JSON string
             "createdAt": datetime.now(timezone.utc).isoformat(),
-            "model": "gpt-5.2-mini",
+            "model": "gpt-5-mini",
         }
     )
 
@@ -388,21 +449,31 @@ def _build_response(status_code: int, body: dict) -> dict:
 
 # ── Handler ──────────────────────────────────────────────
 def lambda_handler(event, context):
+    path = event.get("path", "")
+    http_method = event.get("httpMethod", "")
+
+    if path == "/scan" and http_method == "POST":
+        return _handle_scan(event)
+    elif path == "/analyze" and http_method == "POST":
+        return _handle_analyze(event)
+    else:
+        return _build_response(404, {"error": f"Not found: {http_method} {path}"})
+
+
+def _handle_scan(event):
     """
-    POST /analyze
+    POST /scan
     Body: {
-      "foodItems": "spinach, eggs",        # required
-      "version": "v1",                      # optional, default "v1"
-      "userProfile": { ... },               # optional
-      "oldContext": { ... }                  # optional
+      "image": "<base64-encoded image>",   # required
+      "deviceId": "uuid"                   # required
     }
+    Returns list of identified food items from the image.
     """
     try:
         body = json.loads(event.get("body", "{}") or "{}")
     except json.JSONDecodeError:
         return _build_response(400, {"error": "Invalid JSON body"})
 
-    # ── Device ID (required for rate limiting) ───────────
     device_id = (
         body.get("deviceId")
         or (event.get("headers") or {}).get("x-device-id")
@@ -414,7 +485,69 @@ def lambda_handler(event, context):
             "detail": "Send deviceId in the request body or x-device-id header.",
         })
 
-    # ── Rate limit check ──────────────────────────────────
+    allowed, current_count, limit = _check_and_increment_rate_limit(device_id)
+    if not allowed:
+        return _build_response(429, {
+            "error": "Daily rate limit exceeded",
+            "requestsUsed": current_count,
+            "requestsLimit": limit,
+        })
+
+    image_base64 = body.get("image")
+    if not image_base64:
+        return _build_response(400, {
+            "error": "Missing required field: image",
+            "detail": "Send a base64-encoded image in the 'image' field.",
+        })
+
+    try:
+        result = _scan_image(image_base64)
+    except Exception as e:
+        return _build_response(502, {
+            "error": "Image scan failed",
+            "detail": str(e),
+        })
+
+    return _build_response(200, {
+        "foods": result.get("foods", []),
+        "description": result.get("description", ""),
+        "rateLimit": {
+            "requestsUsed": current_count,
+            "requestsLimit": limit,
+            "requestsRemaining": max(0, limit - current_count),
+            "resetsAt": "midnight UTC",
+        },
+    })
+
+
+def _handle_analyze(event):
+    """
+    POST /analyze
+    Body: {
+      "foodItems": "spinach, eggs",        # required
+      "deviceId": "uuid",                  # required
+      "version": "v1",                     # optional, default "v1"
+      "userProfile": { ... },              # optional
+      "oldContext": { ... }                # optional
+    }
+    Checks DynamoDB cache first; calls OpenAI only on cache miss.
+    """
+    try:
+        body = json.loads(event.get("body", "{}") or "{}")
+    except json.JSONDecodeError:
+        return _build_response(400, {"error": "Invalid JSON body"})
+
+    device_id = (
+        body.get("deviceId")
+        or (event.get("headers") or {}).get("x-device-id")
+        or (event.get("headers") or {}).get("X-Device-Id")
+    )
+    if not device_id:
+        return _build_response(400, {
+            "error": "Missing deviceId",
+            "detail": "Send deviceId in the request body or x-device-id header.",
+        })
+
     allowed, current_count, limit = _check_and_increment_rate_limit(device_id)
     if not allowed:
         return _build_response(429, {
@@ -440,8 +573,20 @@ def lambda_handler(event, context):
     version = body.get("version", "v1")
     user_profile = body.get("userProfile")
     old_context = body.get("oldContext")
+    food_key = _normalize_food_name(food_items)
 
-    # ── Call OpenAI ──────────────────────────────────────
+    # ── Check DynamoDB cache first ────────────────────────
+    cached = _lookup_in_dynamodb(food_key, version)
+    if cached:
+        cached["rateLimit"] = {
+            "requestsUsed": current_count,
+            "requestsLimit": limit,
+            "requestsRemaining": max(0, limit - current_count),
+            "resetsAt": "midnight UTC",
+        }
+        return _build_response(200, cached)
+
+    # ── Cache miss — call OpenAI ──────────────────────────
     try:
         analysis = _call_openai(food_items, user_profile, old_context)
     except Exception as e:
@@ -451,7 +596,6 @@ def lambda_handler(event, context):
         })
 
     # ── Store in DynamoDB ────────────────────────────────
-    food_key = _normalize_food_name(food_items)
     try:
         _store_in_dynamodb(food_key, version, analysis, food_items)
     except Exception as e:
@@ -460,11 +604,11 @@ def lambda_handler(event, context):
             "detail": str(e),
         })
 
-    # ── Return the analysis ──────────────────────────────
     return _build_response(200, {
         "foodItem": food_key,
         "version": version,
         "analysis": analysis,
+        "source": "openai",
         "rateLimit": {
             "requestsUsed": current_count,
             "requestsLimit": limit,

@@ -105,6 +105,14 @@ Resources:
             RestApiId: !Ref NutritionApi
             Auth:
               ApiKeyRequired: true
+        ScanFood:
+          Type: Api
+          Properties:
+            Path: /scan
+            Method: POST
+            RestApiId: !Ref NutritionApi
+            Auth:
+              ApiKeyRequired: true
 
   # ──────────────────────────────────────────────
   # API Gateway
@@ -113,7 +121,7 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       Name: NutritionIntelligenceAPI
-      StageName: !Ref StageName
+      StageName: prod
       Auth:
         ApiKeyRequired: true
 
@@ -129,7 +137,7 @@ Resources:
       Enabled: true
       StageKeys:
         - RestApiId: !Ref NutritionApi
-          StageName: !Ref StageName
+          StageName: prod
 
   NutritionUsagePlan:
     Type: AWS::ApiGateway::UsagePlan
@@ -139,7 +147,7 @@ Resources:
       UsagePlanName: NutritionUsagePlan
       ApiStages:
         - ApiId: !Ref NutritionApi
-          Stage: !Ref StageName
+          Stage: prod
       Throttle:
         BurstLimit: 10
         RateLimit: 5
@@ -155,9 +163,12 @@ Resources:
       UsagePlanId: !Ref NutritionUsagePlan
 
 Outputs:
-  ApiEndpoint:
-    Description: API Gateway endpoint URL
-    Value: !Sub "https://${NutritionApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/analyze"
+  AnalyzeEndpoint:
+    Description: API Gateway endpoint for food analysis
+    Value: !Sub "https://${NutritionApi}.execute-api.${AWS::Region}.amazonaws.com/prod/analyze"
+  ScanEndpoint:
+    Description: API Gateway endpoint for image scanning
+    Value: !Sub "https://${NutritionApi}.execute-api.${AWS::Region}.amazonaws.com/prod/scan"
   ApiKeyId:
     Description: API Key ID (retrieve value with aws apigateway get-api-key --api-key <id> --include-value)
     Value: !Ref NutritionApiKey

@@ -1,0 +1,40 @@
+# ── Nutrition Intelligence Scanner API — Sample Requests ──
+
+# Endpoint Base URL
+# https://39odlpxakb.execute-api.us-east-1.amazonaws.com/prod
+
+# API Key
+# x-api-key: zzgWUFcUOO61JQHtleMHp2TJKozxqXAR8cpBKtuQ
+
+# ══════════════════════════════════════════════
+# BASH / Git Bash / macOS / Linux
+# ══════════════════════════════════════════════
+
+# POST /analyze — Analyze food items
+curl -X POST https://39odlpxakb.execute-api.us-east-1.amazonaws.com/prod/analyze \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: zzgWUFcUOO61JQHtleMHp2TJKozxqXAR8cpBKtuQ" \
+  -d '{
+    "foodItems": "spinach, eggs",
+    "deviceId": "test-device-1",
+    "version": "v1"
+  }'
+
+# POST /scan — Scan a food image (base64)
+curl -X POST https://39odlpxakb.execute-api.us-east-1.amazonaws.com/prod/scan \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: zzgWUFcUOO61JQHtleMHp2TJKozxqXAR8cpBKtuQ" \
+  -d '{
+    "image": "<base64-encoded-image-here>",
+    "deviceId": "test-device-1"
+  }'
+
+# ══════════════════════════════════════════════
+# POWERSHELL (Windows)
+# ══════════════════════════════════════════════
+
+# POST /analyze — Analyze food items
+curl.exe -X POST "https://39odlpxakb.execute-api.us-east-1.amazonaws.com/prod/analyze" -H "Content-Type: application/json" -H "x-api-key: zzgWUFcUOO61JQHtleMHp2TJKozxqXAR8cpBKtuQ" --data-raw "{""foodItems"": ""spinach, eggs"", ""deviceId"": ""test-device-1"", ""version"": ""v1"" "
+
+# POST /scan — Scan a food image (base64)
+curl.exe -X POST "https://39odlpxakb.execute-api.us-east-1.amazonaws.com/prod/scan" -H "Content-Type: application/json" -H "x-api-key: zzgWUFcUOO61JQHtleMHp2TJKozxqXAR8cpBKtuQ" --data-raw "{""image"": ""<base64-encoded-image-here>"", ""deviceId"": ""test-device-1""}"
